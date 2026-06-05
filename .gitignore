@@ -3,5 +3,4 @@ __pycache__/
 *.pyo
 output/
 .claude/
-birding.db
 ebird-mcp-server-main/
