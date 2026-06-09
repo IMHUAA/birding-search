@@ -82,16 +82,29 @@ def init_db(db_path: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_ses_point  ON sessions(point_name);
         CREATE INDEX IF NOT EXISTS idx_ses_date   ON sessions(start_time);
         CREATE INDEX IF NOT EXISTS idx_ses_province ON sessions(province);
+        -- 防止同一 session 中重复插入相同鸟种；NULL 值被视为互不相同（SQLite 特性），
+        -- 实际数据中 taxon_name 不会为 NULL，所以不影响去重效果。
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_serial_taxon
+            ON observations(serial_id, taxon_name);
     """)
     conn.commit()
     return conn
 
 
-# ── 已存在的 serial_id 集合 ───────────────────────────────────────
+# ── 已存在的 serial_id 及 taxoncount ─────────────────────────────
 
-def existing_serial_ids(conn: sqlite3.Connection) -> set[str]:
-    rows = conn.execute("SELECT serial_id FROM sessions").fetchall()
-    return {r[0] for r in rows}
+def existing_session_map(conn: sqlite3.Connection) -> dict[str, int]:
+    """返回 {serial_id: taxoncount}，用于判断哪些 session 是新增/有更新。"""
+    rows = conn.execute("SELECT serial_id, taxoncount FROM sessions").fetchall()
+    return {r[0]: (r[1] or 0) for r in rows}
+
+
+def existing_obs_count(conn: sqlite3.Connection, serial_id: str) -> int:
+    """返回某个 session 在库中已有的 observation 条数（备用校验）。"""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM observations WHERE serial_id = ?", (serial_id,)
+    ).fetchone()
+    return row[0] if row else 0
 
 
 # ── 写入 sessions ─────────────────────────────────────────────────
@@ -128,9 +141,10 @@ def insert_sessions(conn: sqlite3.Connection, sessions: list[dict], fetched_date
 # ── 写入 observations ─────────────────────────────────────────────
 
 def insert_observations(conn: sqlite3.Connection, serial_id: str, species: list[dict]):
+    """批量插入鸟种明细（遇重复 serial_id+taxon_name 自动跳过）。"""
     conn.executemany(
         """
-        INSERT INTO observations
+        INSERT OR IGNORE INTO observations
             (serial_id, taxon_id, taxon_name, latin_name, english_name, family_name, order_name)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
@@ -150,6 +164,34 @@ def insert_observations(conn: sqlite3.Connection, serial_id: str, species: list[
     conn.commit()
 
 
+# ── 更新 session ───────────────────────────────────────────────────
+
+def update_session(conn: sqlite3.Connection, serial_id: str, taxoncount: int, fetched_date: str):
+    conn.execute(
+        """
+        UPDATE sessions SET taxoncount = ?, fetched_date = ?
+        WHERE serial_id = ?
+        """,
+        (taxoncount, fetched_date, serial_id),
+    )
+    conn.commit()
+
+
+# ── 拉取某条 session 的鸟种明细 ────────────────────────────────────
+
+def fetch_and_insert_observations(
+    scraper: BirdReportScraper, conn: sqlite3.Connection,
+    serial_id: str,
+) -> int:
+    """拉取指定 session 的鸟种明细并写入库（重复的自动跳过），返回实际新增条数。"""
+    before = existing_obs_count(conn, serial_id)
+    params = SearchParams(serial_id=serial_id)
+    species = scraper.search(params)
+    insert_observations(conn, serial_id, species)
+    after = existing_obs_count(conn, serial_id)
+    return after - before
+
+
 # ── 主流程 ────────────────────────────────────────────────────────
 
 def sync(date: str, db_path: str):
@@ -159,11 +201,14 @@ def sync(date: str, db_path: str):
 
     conn = init_db(db_path)
     scraper = BirdReportScraper()
-    existing = existing_serial_ids(conn)
+    session_map = existing_session_map(conn)  # {serial_id: db_taxoncount}
     fetched_date = datetime.now().strftime("%Y-%m-%d")
 
-    # 1. 拉取各地区 sessions
+    # 1. 拉取各地区 sessions，区分「新增」与「有更新」
     new_sessions: list[dict] = []
+    updated_sessions: list[dict] = []
+    total_api = 0
+
     for region in REGIONS:
         province = region["province"]
         city = region.get("city", "")
@@ -176,42 +221,75 @@ def sync(date: str, db_path: str):
         scraper._last_url = params.to_report_url()
         try:
             sessions = scraper.search_reports(params)
-            # 过滤已存在的
-            new = [s for s in sessions if str(s.get("serial_id", "")) not in existing]
-            print(f"{province}: {len(sessions)} 条 sessions，其中 {len(new)} 条新增")
+            total_api += len(sessions)
+            new = []
+            updated = []
+            for s in sessions:
+                sid = str(s.get("serial_id", ""))
+                api_count = s.get("taxoncount") or 0
+                if sid not in session_map:
+                    new.append(s)
+                elif api_count > session_map[sid]:
+                    updated.append(s)
             new_sessions.extend(new)
+            updated_sessions.extend(updated)
+            print(
+                f"{province}: {len(sessions)} 条 sessions"
+                f" — 新增 {len(new)}，有更新 {len(updated)}"
+            )
         except Exception as e:
             print(f"{province}: 查询失败 — {e}", file=sys.stderr)
         time.sleep(REQUEST_SLEEP)
 
-    if not new_sessions:
-        print("\n没有新数据，退出。")
+    if not new_sessions and not updated_sessions:
+        print(f"\n共 {total_api} 条 session，无新增也无更新，退出。")
         conn.close()
         return
 
-    # 2. 写入 sessions
-    insert_sessions(conn, new_sessions, fetched_date)
-    print(f"\n写入 {len(new_sessions)} 条 sessions")
+    # 2. 写入新增 sessions
+    if new_sessions:
+        insert_sessions(conn, new_sessions, fetched_date)
+        print(f"\n写入 {len(new_sessions)} 条新 session")
+    else:
+        print(f"\n无新增 session")
 
-    # 3. 逐条拉取鸟种明细
-    total_obs = 0
-    for i, session in enumerate(new_sessions, 1):
+    if updated_sessions:
+        print(f"检测到 {len(updated_sessions)} 条 session 鸟种数有增加")
+
+    # 3. 拉取鸟种明细（新 session + 有更新的旧 session 合并处理）
+    all_to_fetch = list(new_sessions) + list(updated_sessions)
+    total_new_obs = 0
+    total_updated_obs = 0
+
+    for i, session in enumerate(all_to_fetch, 1):
         sid = str(session.get("serial_id", ""))
         point = session.get("point_name", "")
-        count = session.get("taxoncount", "?")
-        print(f"  [{i}/{len(new_sessions)}] {sid} {point} ({count}种) ...", end=" ", flush=True)
+        api_count = session.get("taxoncount", "?")
+        is_updated = sid in session_map  # 在库中已存在 = 是更新
+
+        tag = "更新" if is_updated else "新增"
+        print(
+            f"  [{i}/{len(all_to_fetch)}] [{tag}] {sid} {point} ({api_count}种) ...",
+            end=" ", flush=True,
+        )
         try:
-            params = SearchParams(serial_id=sid)
-            species = scraper.search(params)
-            insert_observations(conn, sid, species)
-            total_obs += len(species)
-            print(f"ok ({len(species)}种)")
+            added = fetch_and_insert_observations(scraper, conn, sid)
+            if is_updated:
+                total_updated_obs += added
+                # 同步更新 session 表的 taxoncount
+                update_session(conn, sid, api_count, fetched_date)
+            else:
+                total_new_obs += added
+            print(f"ok (+{added}种)")
         except Exception as e:
             print(f"失败: {e}", file=sys.stderr)
         time.sleep(REQUEST_SLEEP)
 
     conn.close()
-    print(f"\n完成: 新增 {len(new_sessions)} 条 sessions，{total_obs} 条 observations")
+    print(
+        f"\n完成: 新增 {len(new_sessions)} 条 session（{total_new_obs} 条 observation），"
+        f"更新 {len(updated_sessions)} 条 session（+{total_updated_obs} 条 observation）"
+    )
 
 
 # ── CLI ───────────────────────────────────────────────────────────
