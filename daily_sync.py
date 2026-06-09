@@ -226,7 +226,7 @@ def sync(date: str, db_path: str):
             updated = []
             for s in sessions:
                 sid = str(s.get("serial_id", ""))
-                api_count = s.get("taxoncount") or 0
+                api_count = int(s.get("taxoncount") or 0)
                 if sid not in session_map:
                     new.append(s)
                 elif api_count > session_map[sid]:
